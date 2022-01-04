@@ -6,11 +6,25 @@ import logging
 import pathlib
 import re
 
-import pandas as pd
 from intervaltree import Interval
+import pandas as pd
+import tqdm
+
+from str_analysis.utils.misc_utils import parse_interval
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
+# The basic set of columns that need to be present in the input table
+BASIC_INPUT_COLUMNS = [
+    "SampleId", "LocusId", "VariantId", "Filename", "Genotype", "GenotypeConfidenceInterval", "ReferenceRegion",
+    "RepeatUnit", "Sex", "Num Repeats: Allele 2", "Coverage",
+]
+
+# Optional extra columns that will be added to the output if they're present in the input table
+EXTRA_INPUT_COLUMNS = [
+    "NumSpanningReads", "NumFlankingReads", "NumInrepeatReads",
+    "NumAllelesSupportedBySpanningReads", "NumAllelesSupportedByFlankingReads", "NumAllelesSupportedByInrepeatReads",
+]
 
 def parse_args(args_list=None):
     """Parse command-line args and return the ArgumentParser args object.
@@ -76,9 +90,12 @@ def parse_combined_str_calls_tsv_path(combined_str_calls_tsv_path):
     """
 
     combined_str_calls_df = pd.read_table(combined_str_calls_tsv_path)
-    combined_str_calls_df = combined_str_calls_df[[
-        "SampleId", "LocusId", "VariantId", "Filename", "Genotype", "GenotypeConfidenceInterval", "ReferenceRegion", "RepeatUnit", "Sex", "NumSpanningReads", "NumFlankingReads", "NumInrepeatReads", "NumAllelesSupportedBySpanningReads", "NumAllelesSupportedByFlankingReads", "NumAllelesSupportedByInrepeatReads", "Num Repeats: Allele 2", "Coverage"
-    ]]
+    combined_str_calls_df_columns = set(combined_str_calls_df.columns)
+    expected_columns = list(BASIC_INPUT_COLUMNS)
+    if all(k in combined_str_calls_df_columns for k in EXTRA_INPUT_COLUMNS):
+        expected_columns += list(EXTRA_INPUT_COLUMNS)
+
+    combined_str_calls_df = combined_str_calls_df[expected_columns]
     #combined_str_calls_df = combined_str_calls_df.drop_duplicates()
     combined_str_calls_df.set_index(["Filename", "SampleId", "LocusId", "VariantId"], inplace=True)
     check_for_duplicate_keys(combined_str_calls_df, combined_str_calls_tsv_path)
@@ -102,6 +119,7 @@ def parse_fam_file(fam_file_path):
             "sex",
             "phenotype",
         ],
+        dtype=str,
     )
 
     fam_file_df = fam_file_df[["individual_id", "father_id", "mother_id"]]
@@ -113,40 +131,39 @@ def parse_fam_file(fam_file_path):
 
 def group_rows_by_trio(combined_str_calls_df):
     """Returns a list of row tuples"""
-
-    print(f"{len(combined_str_calls_df)} rows before")
-
+    print("Caching paternal & maternal genotypes")
     all_rows = {}
-    for _, row in combined_str_calls_df.iterrows():
-        all_rows[(row.SampleId, row.LocusId, row.VariantId)] = row
-        all_rows[(row.Filename, row.LocusId, row.VariantId)] = row
+    for _, row in tqdm.tqdm(combined_str_calls_df.iterrows(), unit=" table rows", total=len(combined_str_calls_df)):
+        if row.Genotype is not None:
+            all_rows[(row.SampleId, row.LocusId, row.VariantId)] = row
+            all_rows[(row.Filename, row.LocusId, row.VariantId)] = row
 
-    #all_sample_ids = set(combined_str_calls_df.SampleId)
-
-    print(f"{len(combined_str_calls_df)} rows after")
-
-    #print(f"{len(all_sample_ids)} all_sample_ids")
-    #print( all_sample_ids)
     calls_counter = 0
     trio_ids = set()
-    trios = []
+    trio_rows = []
     other_rows = []
     combined_str_calls_df = combined_str_calls_df[~combined_str_calls_df.father_id.isna() & ~combined_str_calls_df.mother_id.isna()]
-    for _, row in combined_str_calls_df.iterrows():
-        #if row.SampleId in all_sample_ids and row.father_id in all_sample_ids and row.mother_id in all_sample_ids:
-        try:
-            father_row = all_rows[(row.father_id, row.LocusId, row.VariantId)]
-            mother_row = all_rows[(row.mother_id, row.LocusId, row.VariantId)]
-            trio_ids.add((row.SampleId, row.father_id, row.mother_id))
-            trios.append((row, father_row, mother_row))
-            calls_counter += 1
-        except KeyError as e:
-            print(f"WARNING: skipping {row.SampleId} because table doesn't contain {e}")
+    print(f"{len(combined_str_calls_df)} total rows in table, including father and mother genotypes")
+    print(f"{len(combined_str_calls_df)} total rows for proband")
+
+    for _, row in tqdm.tqdm(combined_str_calls_df.iterrows(), unit=" table rows", total=len(combined_str_calls_df)):
+        father_row = all_rows.get((row.father_id, row.LocusId, row.VariantId))
+        mother_row = all_rows.get((row.mother_id, row.LocusId, row.VariantId))
+        if father_row is None or mother_row is None:
+            print(f"WARNING: skipping {row.SampleId} (father: {row.father_id}, mother: {row.mother_id}) {row.VariantId} because table is missing the "
+                  f"{'father genotype' if father_row is None else ''} "
+                  f"{'and' if father_row is None and mother_row is None else ''} "
+                  f"{'mother genotype' if mother_row is None else ''}")
             other_rows.append(row)
+            continue
+
+        trio_ids.add((row.SampleId, row.father_id, row.mother_id))
+        trio_rows.append((row, father_row, mother_row))
+        calls_counter += 1
 
     print(f"Processed {calls_counter} calls in {len(trio_ids)} trios")
 
-    return trios, other_rows
+    return trio_rows, other_rows
 
 
 def intervals_overlap(i1, i2):
@@ -187,7 +204,7 @@ def compute_min_distance_mendelian_ci(proband_CI, parent_CIs):
     return min([abs(proband_CI.distance_to(parent_CI)) for parent_CI in parent_CIs])
 
 
-def compute_mendelian_violations(trios):
+def compute_mendelian_violations(trio_rows):
     """Compute mendelian violations using both exact genotypes and intervals"""
 
     counters = collections.defaultdict(int)
@@ -196,7 +213,7 @@ def compute_mendelian_violations(trios):
     results_ci = []
 
     results_rows = []
-    for proband_row, father_row, mother_row in trios:
+    for proband_row, father_row, mother_row in tqdm.tqdm(trio_rows, unit=" variants with no missing genotypes"):
         locus_id = proband_row.LocusId
         proband_alleles = proband_row.Genotype.split("/")   # Num Repeats: Allele 1
         father_alleles = father_row.Genotype.split("/")
@@ -256,17 +273,30 @@ def compute_mendelian_violations(trios):
             counters_ci[f"{locus_id} ({proband_row.RepeatUnit})"] += 1
 
         #assert not (ok_mendelian and not ok_mendelian_ci)  # it should never be the case that mendelian inheritance is consistent for exact genotypes, and not consistent for CI interval-overlap.
+        _, reference_region_start_0based, reference_region_end_1based = parse_interval(proband_row.ReferenceRegion)
+        if (reference_region_end_1based - reference_region_start_0based) % len(proband_row.RepeatUnit):
+            print(f"WARNING: {proband_row.ReferenceRegion} is not a multiple of the repeat unit size ({len(proband_row.RepeatUnit)})")
 
-        results_rows.append({
+        repeats_in_reference = str(int((reference_region_end_1based - reference_region_start_0based) / len(proband_row.RepeatUnit)))
+        proband_is_homozygous_reference = all(proband_allele == repeats_in_reference for proband_allele in proband_alleles)
+        mother_is_homozygous_reference = all(mother_allele == repeats_in_reference for mother_allele in mother_alleles)
+        father_is_homozygous_reference = all(father_allele == repeats_in_reference for father_allele in father_alleles)
+
+        all_genotypes_are_the_same = set(proband_alleles) == set(mother_alleles) and set(proband_alleles) == set(father_alleles)
+        all_genotypes_are_homozygous_reference = proband_is_homozygous_reference and mother_is_homozygous_reference and father_is_homozygous_reference
+
+        results_row = {
             'LocusId': f"{locus_id} ({proband_row.VariantId})",
             'ReferenceRegion': proband_row.ReferenceRegion,
             'VariantId': proband_row.VariantId,
             'RepeatUnit': proband_row.RepeatUnit,
+            'RepeatUnitLength': len(proband_row.RepeatUnit),
             'IsMendelianViolation': not ok_mendelian,
             'IsMendelianViolationCI': not ok_mendelian_ci,
-
             'MendelianViolationDistance': distance_mendelian,
             'MendelianViolationDistanceCI': distance_mendelian_ci,
+
+            'MendelianViolationSummary': 'MV-CI!' if not ok_mendelian_ci else ('MV' if not ok_mendelian else 'ok'),
 
             'ProbandGenotype': proband_row.Genotype,
             'ProbandGenotypeCI': proband_row.GenotypeConfidenceInterval,
@@ -278,24 +308,13 @@ def compute_mendelian_violations(trios):
             'MotherGenotype': mother_row.Genotype,
             'MotherGenotypeCI': mother_row.GenotypeConfidenceInterval,
 
+            'AllGenotypesAreTheSame': all_genotypes_are_the_same,
+            'AllGenotypesAreHomozygousReference': all_genotypes_are_homozygous_reference,
+
             'ProbandSampleId': proband_row.SampleId,
             'FatherSampleId': father_row.SampleId,
             'MotherSampleId': mother_row.SampleId,
             'ProbandSex': proband_row.Sex,
-
-            'ProbandNumSpanningReads': proband_row.NumSpanningReads,
-            'ProbandNumFlankingReads': proband_row.NumFlankingReads,
-            'ProbandNumInrepeatReads': proband_row.NumInrepeatReads,
-            'FatherNumSpanningReads': father_row.NumSpanningReads,
-            'FatherNumFlankingReads': father_row.NumFlankingReads,
-            'FatherNumInrepeatReads': father_row.NumInrepeatReads,
-            'MotherNumSpanningReads': mother_row.NumSpanningReads,
-            'MotherNumFlankingReads': mother_row.NumFlankingReads,
-            'MotherNumInrepeatReads': mother_row.NumInrepeatReads,
-
-            'ProbandNumAllelesSupportedBySpanningReads': int(proband_row.NumAllelesSupportedBySpanningReads) + int(proband_row.NumAllelesSupportedByFlankingReads) + int(proband_row.NumAllelesSupportedByInrepeatReads),
-            'FatherNumAllelesSupportedByFlankingReads': int(father_row.NumAllelesSupportedBySpanningReads) + int(father_row.NumAllelesSupportedByFlankingReads) + int(father_row.NumAllelesSupportedByInrepeatReads),
-            'MotherNumAllelesSupportedByInrepeatReads': int(mother_row.NumAllelesSupportedBySpanningReads) + int(mother_row.NumAllelesSupportedByFlankingReads) + int(mother_row.NumAllelesSupportedByInrepeatReads),
 
             'ProbandNumRepeatsAllele2': proband_row['Num Repeats: Allele 2'],
             'FatherNumRepeatsAllele2 ': father_row['Num Repeats: Allele 2'],
@@ -308,7 +327,27 @@ def compute_mendelian_violations(trios):
 
             'mendelian_results_string': mendelian_results_string,
             'mendelian_ci_results_string': mendelian_ci_results_string,
-        })
+        }
+
+        existing_column_names = set(proband_row.to_dict().keys()) & set(father_row.to_dict().keys()) & set(mother_row.to_dict().keys())
+        if all(k in existing_column_names for k in EXTRA_INPUT_COLUMNS):
+           results_row.update({
+               'ProbandNumSpanningReads': proband_row.NumSpanningReads,
+               'ProbandNumFlankingReads': proband_row.NumFlankingReads,
+               'ProbandNumInrepeatReads': proband_row.NumInrepeatReads,
+               'FatherNumSpanningReads': father_row.NumSpanningReads,
+               'FatherNumFlankingReads': father_row.NumFlankingReads,
+               'FatherNumInrepeatReads': father_row.NumInrepeatReads,
+               'MotherNumSpanningReads': mother_row.NumSpanningReads,
+               'MotherNumFlankingReads': mother_row.NumFlankingReads,
+               'MotherNumInrepeatReads': mother_row.NumInrepeatReads,
+
+               'ProbandNumAllelesSupportedBySpanningReads': int(proband_row.NumAllelesSupportedBySpanningReads) + int(proband_row.NumAllelesSupportedByFlankingReads) + int(proband_row.NumAllelesSupportedByInrepeatReads),
+               'FatherNumAllelesSupportedByFlankingReads': int(father_row.NumAllelesSupportedBySpanningReads) + int(father_row.NumAllelesSupportedByFlankingReads) + int(father_row.NumAllelesSupportedByInrepeatReads),
+               'MotherNumAllelesSupportedByInrepeatReads': int(mother_row.NumAllelesSupportedBySpanningReads) + int(mother_row.NumAllelesSupportedByFlankingReads) + int(mother_row.NumAllelesSupportedByInrepeatReads),
+           })
+
+        results_rows.append(results_row)
 
         #if ok_mendelian_ci and not ok_mendelian:
         #    print("    " + mendelian_results_string)
@@ -317,12 +356,12 @@ def compute_mendelian_violations(trios):
         #print(results_ci[-1])
 
     for name, c in sorted(counters.items(), key=lambda t: -t[1]):
-        print(f"{c:5d}  ({100*float(c)/len(trios):0.0f}%) {name}")
+        print(f"{c:5d}  ({100*float(c)/len(trio_rows):0.0f}%) {name}")
 
     print("\n".join(sorted(results)))
 
     for name, c in sorted(counters_ci.items(), key=lambda t: -t[1]):
-        print(f"{c:5d}  ({100*float(c)/len(trios):0.0f}%) {name}")
+        print(f"{c:5d}  ({100*float(c)/len(trio_rows):0.0f}%) {name}")
 
     print("\n".join(sorted(results_ci)))
 
@@ -342,11 +381,11 @@ def main():
 
     combined_str_calls_df = combined_str_calls_df.join(fam_file_df, how="left").reset_index().rename(columns={"index": "SampleId"})
 
-    combined_str_calls_df = combined_str_calls_df.fillna(0)
+    #combined_str_calls_df = combined_str_calls_df.fillna(0)
 
-    trios, other_rows = group_rows_by_trio(combined_str_calls_df)
+    trio_rows, other_rows = group_rows_by_trio(combined_str_calls_df)
 
-    mendelian_violations_df = compute_mendelian_violations(trios)
+    mendelian_violations_df = compute_mendelian_violations(trio_rows)
     other_rows_df = pd.DataFrame((r.to_dict() for r in other_rows))
 
     output_tsv_path = re.sub(".tsv$", "", str(args.combined_str_calls_tsv)) + ".mendelian_violations.tsv"
